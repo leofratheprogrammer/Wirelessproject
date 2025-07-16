@@ -1,38 +1,67 @@
+import pyshark
 import time
 import joblib
 import pandas as pd
-from config import MODEL_PATH, WINDOW_SIZE, ACTIVITIES
+import numpy as np
+from datetime import datetime
+from collections import deque
+from config import USER_MAC, MODEL_PATH, ACTIVITIES, WINDOW_SIZE, FEATURE_COLS
 from feature_extractor import extract_features
-from data_loader import load_and_preprocess_data
 
 
-def simulate_live_classification():
-    """Simula classificazione in tempo reale su dati CSV"""
-    # Caricamento modello
-    model = joblib.load(MODEL_PATH)
-    df = load_and_preprocess_data()
+class LiveClassifier:
+    def __init__(self, interface='wlan0mon'):
+        self.model = joblib.load(MODEL_PATH)
+        self.interface = interface
+        self.buffer = deque(maxlen=10000)
+        self.last_time = time.time()
 
-    # Finestra temporale scorrevole
-    start_time = df['timestamp'].min()
-    end_time = start_time + pd.Timedelta(seconds=WINDOW_SIZE)
+    def packet_handler(self, pkt):
+        try:
+            if hasattr(pkt, 'wlan'):
+                src = pkt.wlan.sa
+                dst = pkt.wlan.da
+                if USER_MAC not in [src, dst]:
+                    return
 
-    while end_time <= df['timestamp'].max():
-        # Estrazione finestra corrente
-        window = df[(df['timestamp'] >= start_time) &
-                    (df['timestamp'] < end_time)]
+                direction = 'up' if src == USER_MAC else 'down'
+                self.buffer.append({
+                    'timestamp': pkt.sniff_time.timestamp(),
+                    'packet_size': int(pkt.length),
+                    'direction': direction
+                })
 
-        if not window.empty:
-            # Estrazione features e predizione
-            features = extract_features(window).to_frame().T.fillna(0)
-            activity_id = model.predict(features)[0]
+                # Processa ogni W secondi
+                if time.time() - self.last_time >= WINDOW_SIZE:
+                    self.process_window()
+                    self.last_time = time.time()
 
-            print(f"[{start_time} - {end_time}] Attività rilevata: {ACTIVITIES[activity_id]}")
+        except AttributeError:
+            pass
 
-        # Scorrimento finestra
-        start_time = end_time
-        end_time = start_time + pd.Timedelta(seconds=WINDOW_SIZE)
-        time.sleep(1)  # Simula tempo reale
+    def process_window(self):
+        if not self.buffer:
+            return
+
+        df = pd.DataFrame(self.buffer)
+        features = extract_features(df)[FEATURE_COLS].fillna(0).iloc[-1:]
+
+        if not features.empty:
+            activity = self.model.predict(features)[0]
+            print(f"[{datetime.now()}] Attività: {ACTIVITIES[activity]}")
+
+        # Pulisci buffer
+        self.buffer.clear()
+
+    def start(self):
+        print(f"Avvio sniffing su {self.interface}...")
+        capture = pyshark.LiveCapture(
+            interface=self.interface,
+            display_filter=f"wlan.addr == {USER_MAC}"
+        )
+        capture.apply_on_packets(self.packet_handler)
 
 
 if __name__ == "__main__":
-    simulate_live_classification()
+    classifier = LiveClassifier()
+    classifier.start()
